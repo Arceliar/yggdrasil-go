@@ -19,7 +19,7 @@ Slight changes *do* make it blackhole hard, bootstrapping isn't an easy problem
 */
 
 import (
-	"sort"
+	"container/heap"
 	"time"
 )
 
@@ -190,38 +190,45 @@ func (t *dht) handleRes(res *dhtRes) {
 	}
 }
 
+// Heap structure used in lookups
+type lheap struct {
+	nodeID *NodeID    // NodeID of destination
+	slice  []*dhtInfo // Underlying slice storage
+}
+
+func (h lheap) Len() int { return len(h.slice) }
+func (h lheap) Less(i, j int) bool {
+	return dht_firstCloserThanThird(h.slice[i].getNodeID(), h.nodeID, h.slice[j].getNodeID())
+}
+func (h lheap) Swap(i, j int)       { h.slice[i], h.slice[j] = h.slice[j], h.slice[i] }
+func (h *lheap) Push(x interface{}) { h.slice = append(h.slice, x.(*dhtInfo)) }
+func (h *lheap) Pop() interface{} {
+	var ret interface{}
+	ret, h.slice = h.slice[h.Len()-1], h.slice[:h.Len()-1]
+	return ret
+}
+
 // Does a DHT lookup and returns the results, sorted in ascending order of distance from the destination.
 func (t *dht) lookup(nodeID *NodeID, allowCloser bool) []*dhtInfo {
-	// FIXME this allocates a bunch, sorts, and keeps the part it likes
-	// It would be better to only track the part it likes to begin with
-	addInfos := func(res []*dhtInfo, infos []*dhtInfo) []*dhtInfo {
+	h := lheap{nodeID: nodeID}
+	addInfos := func(h heap.Interface, infos []*dhtInfo) {
 		for _, info := range infos {
 			if info == nil {
 				panic("Should never happen!")
 			}
 			if allowCloser || dht_firstCloserThanThird(info.getNodeID(), nodeID, &t.nodeID) {
-				res = append(res, info)
+				heap.Push(h, info)
 			}
 		}
-		return res
 	}
-	var res []*dhtInfo
 	for bidx := 0; bidx < t.nBuckets(); bidx++ {
 		b := t.getBucket(bidx)
-		res = addInfos(res, b.peers)
-		res = addInfos(res, b.other)
+		addInfos(&h, b.peers)
+		addInfos(&h, b.other)
 	}
-	doSort := func(infos []*dhtInfo) {
-		less := func(i, j int) bool {
-			return dht_firstCloserThanThird(infos[i].getNodeID(),
-				nodeID,
-				infos[j].getNodeID())
-		}
-		sort.SliceStable(infos, less)
-	}
-	doSort(res)
-	if len(res) > dht_lookup_size {
-		res = res[:dht_lookup_size]
+	var res []*dhtInfo
+	for len(res) < dht_lookup_size && h.Len() > 0 {
+		res = append(res, heap.Pop(&h).(*dhtInfo))
 	}
 	return res
 }
