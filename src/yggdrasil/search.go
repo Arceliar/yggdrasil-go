@@ -23,8 +23,13 @@ import (
 )
 
 // This defines the time after which we time out a search (so it can restart).
-const search_RETRY_TIME = 3 * time.Second
-const search_STEP_TIME = 100 * time.Millisecond
+const search_TIMEOUT = 3 * time.Second
+const search_MAX_RESULTS = 16
+
+type searchVisitedKey struct {
+	key    crypto.BoxPubKey
+	coords string //string([]byte) of coords, usable as a map key
+}
 
 // Information about an ongoing search.
 // Includes the target NodeID, the bitmask to match it to an IP, and the list of nodes to visit / already visited.
@@ -32,8 +37,8 @@ type searchInfo struct {
 	searches *searches
 	dest     crypto.NodeID
 	mask     crypto.NodeID
-	time     time.Time
-	visited  crypto.NodeID // Closest address visited so far
+	timer    *time.Timer
+	visited  map[searchVisitedKey]struct{} // key+coord pairs visited so far
 	callback func(*sessionInfo, error)
 	// TODO context.Context for timeout and cancellation
 	send uint64 // log number of requests sent
@@ -62,7 +67,6 @@ func (s *searches) createSearch(dest *crypto.NodeID, mask *crypto.NodeID, callba
 		searches: s,
 		dest:     *dest,
 		mask:     *mask,
-		time:     time.Now(),
 		callback: callback,
 	}
 	s.searches[*dest] = &info
@@ -75,14 +79,17 @@ func (s *searches) createSearch(dest *crypto.NodeID, mask *crypto.NodeID, callba
 // If there is, it adds the response info to the search and triggers a new search step.
 // If there's no ongoing search, or we if the dhtRes finished the search (it was from the target node), then don't do anything more.
 func (sinfo *searchInfo) handleDHTRes(res *dhtRes) {
+	if sinfo != sinfo.searches.searches[sinfo.dest] {
+		// Search already over
+		return
+	}
 	if res != nil {
 		sinfo.recv++
 		if sinfo.checkDHTRes(res) {
 			return // Search finished successfully
 		}
 		// Use results to start an additional search thread
-		infos := append([]*dhtInfo(nil), res.Infos...)
-		infos = sinfo.getAllowedInfos(infos)
+		infos := sinfo.getAllowedInfos(res)
 		if len(infos) > 0 {
 			sinfo.continueSearch(infos)
 		}
@@ -92,29 +99,37 @@ func (sinfo *searchInfo) handleDHTRes(res *dhtRes) {
 // If there has been no response in too long, then this cleans up the search.
 // Otherwise, it pops the closest node to the destination (in keyspace) off of the toVisit list and sends a dht ping.
 func (sinfo *searchInfo) doSearchStep(infos []*dhtInfo) {
-	if len(infos) > 0 {
-		// Send to the next search target
-		next := infos[0]
-		rq := dhtReqKey{next.key, sinfo.dest}
-		sinfo.searches.router.dht.addCallback(&rq, sinfo.handleDHTRes)
-		sinfo.searches.router.dht.ping(next, &sinfo.dest)
-		sinfo.send++
+	for _, info := range infos {
+		svk := searchVisitedKey{info.key, string(info.coords)}
+		if _, isIn := sinfo.visited[svk]; !isIn {
+			sinfo.visited[svk] = struct{}{}
+			rq := dhtReqKey{info.key, sinfo.dest}
+			sinfo.searches.router.dht.addCallback(&rq, sinfo.handleDHTRes)
+			sinfo.searches.router.dht.ping(info, &sinfo.dest)
+			sinfo.send++
+		}
 	}
 }
 
 // Get a list of search targets that are close enough to the destination to try
 // Requires an initial list as input
-func (sinfo *searchInfo) getAllowedInfos(infos []*dhtInfo) []*dhtInfo {
+func (sinfo *searchInfo) getAllowedInfos(res *dhtRes) []*dhtInfo {
+	infos := append([]*dhtInfo(nil), res.Infos...)
 	sort.SliceStable(infos, func(i, j int) bool {
 		// Should return true if i is closer to the destination than j
 		return dht_ordered(&sinfo.dest, infos[i].getNodeID(), infos[j].getNodeID())
 	})
-	// Remove anything too far away to be useful
+	// Remove anything further from the destination than the node we asked
+	from := dhtInfo{key: res.Key, coords: res.Coords}
 	for idx, info := range infos {
-		if !dht_ordered(&sinfo.dest, info.getNodeID(), &sinfo.visited) {
+		if from.key == info.key || !dht_ordered(&sinfo.dest, info.getNodeID(), from.getNodeID()) {
 			infos = infos[:idx]
 			break
 		}
+	}
+	// Make sure there's some kind of limit
+	if len(infos) > search_MAX_RESULTS {
+		infos = infos[:search_MAX_RESULTS]
 	}
 	return infos
 }
@@ -122,21 +137,20 @@ func (sinfo *searchInfo) getAllowedInfos(infos []*dhtInfo) []*dhtInfo {
 // Run doSearchStep and schedule another continueSearch to happen after search_RETRY_TIME.
 // Must not be called with an empty list of infos
 func (sinfo *searchInfo) continueSearch(infos []*dhtInfo) {
+	if sinfo.timer != nil {
+		sinfo.timer.Stop()
+	}
 	sinfo.doSearchStep(infos)
-	infos = infos[1:] // Remove the node we just tried
-	// In case there's no response, try the next node in infos later
-	time.AfterFunc(search_STEP_TIME, func() {
+	// In case there's no response, remove the search
+	sinfo.timer = time.AfterFunc(search_TIMEOUT, func() {
 		sinfo.searches.router.Act(nil, func() {
 			// FIXME this keeps the search alive forever if not for the searches map, fix that
 			newSearchInfo := sinfo.searches.searches[sinfo.dest]
 			if newSearchInfo != sinfo {
 				return
 			}
-			// Get good infos here instead of at the top, to make sure we can always start things off with a continueSearch call to ourself
-			infos = sinfo.getAllowedInfos(infos)
-			if len(infos) > 0 {
-				sinfo.continueSearch(infos)
-			}
+			delete(sinfo.searches.searches, sinfo.dest)
+			sinfo.callback(nil, errors.New("search timeout"))
 		})
 	})
 }
@@ -151,32 +165,13 @@ func (sinfo *searchInfo) startSearch() {
 	})
 	// Start the search by asking ourself, useful if we're the destination
 	sinfo.continueSearch(infos)
-	// Start a timer to clean up the search if everything times out
-	var cleanupFunc func()
-	cleanupFunc = func() {
-		sinfo.searches.router.Act(nil, func() {
-			// FIXME this keeps the search alive forever if not for the searches map, fix that
-			newSearchInfo := sinfo.searches.searches[sinfo.dest]
-			if newSearchInfo != sinfo {
-				return
-			}
-			elapsed := time.Since(sinfo.time)
-			if elapsed > search_RETRY_TIME {
-				// cleanup
-				delete(sinfo.searches.searches, sinfo.dest)
-				sinfo.callback(nil, errors.New("search reached dead end"))
-				return
-			}
-			time.AfterFunc(search_RETRY_TIME-elapsed, cleanupFunc)
-		})
-	}
-	time.AfterFunc(search_RETRY_TIME, cleanupFunc)
 }
 
 // Calls create search, and initializes the iterative search parts of the struct before returning it.
 func (s *searches) newIterSearch(dest *crypto.NodeID, mask *crypto.NodeID, callback func(*sessionInfo, error)) *searchInfo {
+	// TODO remove this function, just do it all in createSearch
 	sinfo := s.createSearch(dest, mask, callback)
-	sinfo.visited = s.router.dht.nodeID
+	sinfo.visited = make(map[searchVisitedKey]struct{})
 	return sinfo
 }
 
@@ -185,13 +180,8 @@ func (s *searches) newIterSearch(dest *crypto.NodeID, mask *crypto.NodeID, callb
 // Otherwise return false.
 func (sinfo *searchInfo) checkDHTRes(res *dhtRes) bool {
 	from := dhtInfo{key: res.Key, coords: res.Coords}
-	if *from.getNodeID() != sinfo.visited && dht_ordered(&sinfo.dest, from.getNodeID(), &sinfo.visited) {
-		// Closer to the destination, so update visited
-		sinfo.searches.router.core.log.Debugln("Updating search:", &sinfo.dest, from.getNodeID(), sinfo.send, sinfo.recv)
-		sinfo.visited = *from.getNodeID()
-		sinfo.time = time.Now()
-	}
 	them := from.getNodeID()
+	sinfo.searches.router.core.log.Debugln("Updating search:", &sinfo.dest, them, sinfo.send, sinfo.recv)
 	var destMasked crypto.NodeID
 	var themMasked crypto.NodeID
 	for idx := 0; idx < crypto.NodeIDLen; idx++ {
@@ -215,7 +205,7 @@ func (sinfo *searchInfo) checkDHTRes(res *dhtRes) bool {
 		// Cleanup
 		if _, isIn := sinfo.searches.searches[sinfo.dest]; isIn {
 			sinfo.searches.router.core.log.Debugln("Finished search:", &sinfo.dest, sinfo.send, sinfo.recv)
-			delete(sinfo.searches.searches, res.Dest)
+			delete(sinfo.searches.searches, sinfo.dest)
 		}
 	}
 	// They match, so create a session and send a sessionRequest
