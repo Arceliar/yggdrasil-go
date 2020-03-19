@@ -138,6 +138,9 @@ func (sinfo *searchInfo) retryVisiting() {
 				sinfo.timer.Stop()
 			}
 			sinfo.timer = time.AfterFunc(search_TIMEOUT, func() {
+				if sfo := sinfo.searches.searches[sinfo.dest]; sfo != sinfo {
+					return // search already over
+				}
 				delete(sinfo.searches.searches, sinfo.dest)
 				sinfo.callback(nil, errors.New("search timeout"))
 				sinfo.searches.router.core.log.Debugln("Search timeout:", &sinfo.dest, sinfo.send, sinfo.recv)
