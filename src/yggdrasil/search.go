@@ -26,7 +26,7 @@ import (
 const search_TIMEOUT = 3 * time.Second
 const search_MAX_RESULTS = 16
 
-type searchVisitedKey struct {
+type searchMapKey struct {
 	key    crypto.BoxPubKey
 	coords string //string([]byte) of coords, usable as a map key
 }
@@ -38,7 +38,7 @@ type searchInfo struct {
 	dest     crypto.NodeID
 	mask     crypto.NodeID
 	timer    *time.Timer
-	visited  map[searchVisitedKey]struct{} // key+coord pairs visited so far
+	visited  map[searchMapKey]struct{} // key+coord pairs visited so far
 	callback func(*sessionInfo, error)
 	// TODO context.Context for timeout and cancellation
 	send uint64 // log number of requests sent
@@ -85,9 +85,9 @@ func (sinfo *searchInfo) handleDHTRes(res *dhtRes) {
 	}
 	if res != nil {
 		sinfo.recv++
-		svk := searchVisitedKey{res.Key, string(res.Coords)}
-		if _, isIn := sinfo.visited[svk]; !isIn {
-			sinfo.visited[svk] = struct{}{}
+		smk := searchMapKey{res.Key, string(res.Coords)}
+		if _, isIn := sinfo.visited[smk]; !isIn {
+			sinfo.visited[smk] = struct{}{}
 			if sinfo.checkDHTRes(res) {
 				return // Search finished successfully
 			}
@@ -104,8 +104,8 @@ func (sinfo *searchInfo) handleDHTRes(res *dhtRes) {
 // Otherwise, it pops the closest node to the destination (in keyspace) off of the toVisit list and sends a dht ping.
 func (sinfo *searchInfo) doSearchStep(infos []*dhtInfo) {
 	for _, info := range infos {
-		svk := searchVisitedKey{info.key, string(info.coords)}
-		if _, isIn := sinfo.visited[svk]; !isIn {
+		smk := searchMapKey{info.key, string(info.coords)}
+		if _, isIn := sinfo.visited[smk]; !isIn {
 			rq := dhtReqKey{info.key, sinfo.dest}
 			sinfo.searches.router.dht.addCallback(&rq, sinfo.handleDHTRes)
 			sinfo.searches.router.dht.ping(info, &sinfo.dest)
@@ -175,7 +175,7 @@ func (sinfo *searchInfo) startSearch() {
 func (s *searches) newIterSearch(dest *crypto.NodeID, mask *crypto.NodeID, callback func(*sessionInfo, error)) *searchInfo {
 	// TODO remove this function, just do it all in createSearch
 	sinfo := s.createSearch(dest, mask, callback)
-	sinfo.visited = make(map[searchVisitedKey]struct{})
+	sinfo.visited = make(map[searchMapKey]struct{})
 	return sinfo
 }
 
