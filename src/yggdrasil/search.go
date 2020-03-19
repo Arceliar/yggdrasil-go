@@ -85,13 +85,17 @@ func (sinfo *searchInfo) handleDHTRes(res *dhtRes) {
 	}
 	if res != nil {
 		sinfo.recv++
-		if sinfo.checkDHTRes(res) {
-			return // Search finished successfully
-		}
-		// Use results to start an additional search thread
-		infos := sinfo.getAllowedInfos(res)
-		if len(infos) > 0 {
-			sinfo.continueSearch(infos)
+		svk := searchVisitedKey{res.Key, string(res.Coords)}
+		if _, isIn := sinfo.visited[svk]; !isIn {
+			sinfo.visited[svk] = struct{}{}
+			if sinfo.checkDHTRes(res) {
+				return // Search finished successfully
+			}
+			// Use results to start an additional search thread
+			infos := sinfo.getAllowedInfos(res)
+			if len(infos) > 0 {
+				sinfo.continueSearch(infos)
+			}
 		}
 	}
 }
@@ -102,7 +106,6 @@ func (sinfo *searchInfo) doSearchStep(infos []*dhtInfo) {
 	for _, info := range infos {
 		svk := searchVisitedKey{info.key, string(info.coords)}
 		if _, isIn := sinfo.visited[svk]; !isIn {
-			sinfo.visited[svk] = struct{}{}
 			rq := dhtReqKey{info.key, sinfo.dest}
 			sinfo.searches.router.dht.addCallback(&rq, sinfo.handleDHTRes)
 			sinfo.searches.router.dht.ping(info, &sinfo.dest)
@@ -149,6 +152,7 @@ func (sinfo *searchInfo) continueSearch(infos []*dhtInfo) {
 			if newSearchInfo != sinfo {
 				return
 			}
+			sinfo.searches.router.core.log.Debugln("search timeout:", &sinfo.dest, sinfo.send, sinfo.recv)
 			delete(sinfo.searches.searches, sinfo.dest)
 			sinfo.callback(nil, errors.New("search timeout"))
 		})
