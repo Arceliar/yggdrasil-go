@@ -24,7 +24,7 @@ import (
 
 const search_TIMEOUT = 3 * time.Second
 const search_RETRY_TIME = 100 * time.Millisecond
-const search_MAX_RESULTS = 16
+const search_MAX_RESULTS = dht_lookup_size
 const search_MAX_RETRY = 3
 
 type searchRumor struct {
