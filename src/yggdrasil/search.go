@@ -27,13 +27,13 @@ const search_RETRY_TIME = 100 * time.Millisecond
 const search_MAX_RESULTS = 16
 const search_MAX_RETRY = 3
 
-type searchMapKey struct {
+type searchRumor struct {
 	key    crypto.BoxPubKey
 	coords string //string([]byte) of coords, usable as a map key
 }
 
-type searchVisitingVal struct {
-	smk  searchMapKey
+type searchVisiting struct {
+	sr   searchRumor
 	info *dhtInfo
 }
 
@@ -44,8 +44,8 @@ type searchInfo struct {
 	dest     crypto.NodeID
 	mask     crypto.NodeID
 	timer    *time.Timer
-	visited  map[searchMapKey]struct{} // key+coord pairs visited so far
-	visiting []*searchVisitingVal
+	visited  map[crypto.BoxPubKey]struct{} // key+coord pairs visited so far
+	visiting []*searchVisiting
 	callback func(*sessionInfo, error)
 	// TODO context.Context for timeout and cancellation
 	send uint64 // log number of requests sent
@@ -85,15 +85,15 @@ func (s *searches) createSearch(dest *crypto.NodeID, mask *crypto.NodeID, callba
 // Checks if there's an ongoing search related to a dhtRes.
 // If there is, it adds the response info to the search and triggers a new search step.
 // If there's no ongoing search, or we if the dhtRes finished the search (it was from the target node), then don't do anything more.
-func (sinfo *searchInfo) handleDHTRes(smk searchMapKey, res *dhtRes) {
+func (sinfo *searchInfo) handleDHTRes(res *dhtRes) {
 	if sinfo != sinfo.searches.searches[sinfo.dest] {
 		// Search already over
 		return
 	}
 	if res != nil {
 		sinfo.recv++
-		if _, isIn := sinfo.visited[smk]; !isIn {
-			sinfo.visited[smk] = struct{}{}
+		if _, isIn := sinfo.visited[res.Key]; !isIn {
+			sinfo.visited[res.Key] = struct{}{}
 			if sinfo.checkDHTRes(res) {
 				return // Search finished successfully
 			}
@@ -104,12 +104,10 @@ func (sinfo *searchInfo) handleDHTRes(smk searchMapKey, res *dhtRes) {
 	}
 }
 
-func (sinfo *searchInfo) sendSearchLookup(svv *searchVisitingVal) {
-	rq := dhtReqKey{svv.info.key, sinfo.dest}
-	sinfo.searches.router.dht.addCallback(&rq, func(res *dhtRes) {
-		sinfo.handleDHTRes(svv.smk, res)
-	})
-	sinfo.searches.router.dht.ping(svv.info, &sinfo.dest)
+func (sinfo *searchInfo) sendSearchLookup(sv *searchVisiting) {
+	rq := dhtReqKey{sv.info.key, sinfo.dest}
+	sinfo.searches.router.dht.addCallback(&rq, sinfo.handleDHTRes)
+	sinfo.searches.router.dht.ping(sv.info, &sinfo.dest)
 	sinfo.send++
 	if sinfo.timer != nil {
 		sinfo.timer.Stop()
@@ -117,7 +115,7 @@ func (sinfo *searchInfo) sendSearchLookup(svv *searchVisitingVal) {
 	sinfo.timer = time.AfterFunc(search_RETRY_TIME, func() {
 		sinfo.searches.router.Act(nil, func() { sinfo.retryVisiting() })
 	})
-	sinfo.searches.router.core.log.Debugln("Sending search lookup:", &sinfo.dest, svv.info.getNodeID(), sinfo.send, sinfo.recv, len(sinfo.visiting))
+	sinfo.searches.router.core.log.Debugln("Sending search lookup:", &sinfo.dest, sv.info.getNodeID(), sinfo.send, sinfo.recv, len(sinfo.visiting))
 }
 
 func (sinfo *searchInfo) retryVisiting() {
@@ -128,7 +126,7 @@ func (sinfo *searchInfo) retryVisiting() {
 		if len(sinfo.visiting) > 0 {
 			svv := sinfo.visiting[0]
 			sinfo.visiting = sinfo.visiting[1:]
-			if _, isIn := sinfo.visited[svv.smk]; isIn {
+			if _, isIn := sinfo.visited[svv.info.key]; isIn {
 				continue
 			}
 			sinfo.sendSearchLookup(svv)
@@ -171,22 +169,22 @@ func (sinfo *searchInfo) getAllowedInfos(res *dhtRes) []*dhtInfo {
 }
 
 func (sinfo *searchInfo) addToSearch(infos []*dhtInfo) {
-	m := make(map[searchMapKey]*searchVisitingVal)
-	for _, svv := range sinfo.visiting {
-		if _, isIn := sinfo.visited[svv.smk]; isIn {
+	m := make(map[searchRumor]*searchVisiting)
+	for _, sv := range sinfo.visiting {
+		if _, isIn := sinfo.visited[sv.info.key]; isIn {
 			continue
 		}
-		m[svv.smk] = svv
+		m[sv.sr] = sv
 	}
 	for _, info := range infos {
-		smk := searchMapKey{info.key, string(info.coords)}
-		if _, isIn := sinfo.visited[smk]; isIn {
+		sr := searchRumor{info.key, string(info.coords)}
+		if _, isIn := sinfo.visited[info.key]; isIn {
 			continue
-		} else if _, isIn := m[smk]; isIn {
+		} else if _, isIn := m[sr]; isIn {
 			continue
 		}
-		svv := &searchVisitingVal{smk, info}
-		m[smk] = svv
+		sv := &searchVisiting{sr, info}
+		m[sr] = sv
 		//sinfo.sendSearchLookup(svv)
 	}
 	sinfo.visiting = sinfo.visiting[:0]
@@ -216,7 +214,7 @@ func (sinfo *searchInfo) startSearch() {
 func (s *searches) newIterSearch(dest *crypto.NodeID, mask *crypto.NodeID, callback func(*sessionInfo, error)) *searchInfo {
 	// TODO remove this function, just do it all in createSearch
 	sinfo := s.createSearch(dest, mask, callback)
-	sinfo.visited = make(map[searchMapKey]struct{})
+	sinfo.visited = make(map[crypto.BoxPubKey]struct{})
 	return sinfo
 }
 
