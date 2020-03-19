@@ -46,7 +46,7 @@ type searchInfo struct {
 	timer    *time.Timer
 	visited  map[crypto.BoxPubKey]struct{} // key+coord pairs visited so far
 	visiting []*searchVisiting
-	closest  crypto.NodeID
+	closest  []*crypto.NodeID
 	callback func(*sessionInfo, error)
 	// TODO context.Context for timeout and cancellation
 	send uint64 // log number of requests sent
@@ -75,9 +75,9 @@ func (s *searches) createSearch(dest *crypto.NodeID, mask *crypto.NodeID, callba
 		searches: s,
 		dest:     *dest,
 		mask:     *mask,
-		closest:  *dest,
 		callback: callback,
 	}
+	info.closest = append(info.closest, &info.dest)
 	s.searches[*dest] = &info
 	return &info
 }
@@ -161,7 +161,7 @@ func (sinfo *searchInfo) getAllowedInfos(res *dhtRes) []*dhtInfo {
 	// Remove anything further from the destination than the closest node visited so far
 	from := dhtInfo{key: res.Key, coords: res.Coords}
 	for idx, info := range infos {
-		if from.key == info.key || !dht_ordered(&sinfo.dest, info.getNodeID(), &sinfo.closest) {
+		if from.key == info.key || !dht_ordered(&sinfo.dest, info.getNodeID(), sinfo.closest[len(sinfo.closest)-1]) {
 			infos = infos[:idx]
 			break
 		}
@@ -229,8 +229,15 @@ func (s *searches) newIterSearch(dest *crypto.NodeID, mask *crypto.NodeID, callb
 func (sinfo *searchInfo) checkDHTRes(res *dhtRes) bool {
 	from := dhtInfo{key: res.Key, coords: res.Coords}
 	them := from.getNodeID()
-	if dht_ordered(&sinfo.dest, them, &sinfo.closest) {
-		sinfo.closest = *them
+	sinfo.closest = append(sinfo.closest, them)
+	sort.SliceStable(sinfo.closest, func(i, j int) bool {
+		// Should return true if i is closer to the destination than j
+		return dht_ordered(&sinfo.dest, sinfo.closest[i], sinfo.closest[j])
+	})
+	if len(sinfo.closest) > search_MAX_RESULTS {
+		sinfo.closest = sinfo.closest[:search_MAX_RESULTS]
+	}
+	if dht_ordered(&sinfo.dest, them, sinfo.closest[len(sinfo.closest)-1]) {
 		sinfo.searches.router.core.log.Debugln("Updating search:", &sinfo.dest, them, sinfo.send, sinfo.recv)
 	}
 	var destMasked crypto.NodeID
