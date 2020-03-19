@@ -91,10 +91,6 @@ func (sinfo *searchInfo) handleDHTRes(smk searchMapKey, res *dhtRes) {
 		return
 	}
 	if res != nil {
-		if svv, isIn := sinfo.visiting[smk]; isIn {
-			svv.timer.Stop()
-		}
-		delete(sinfo.visiting, smk)
 		sinfo.recv++
 		if _, isIn := sinfo.visited[smk]; !isIn {
 			sinfo.visited[smk] = struct{}{}
@@ -107,6 +103,17 @@ func (sinfo *searchInfo) handleDHTRes(smk searchMapKey, res *dhtRes) {
 				sinfo.addToSearch(infos)
 			}
 		}
+		sinfo.removeFromSearch(smk)
+	}
+}
+
+func (sinfo *searchInfo) removeFromSearch(smk searchMapKey) {
+	delete(sinfo.visiting, smk)
+	sinfo.visited[smk] = struct{}{}
+	if len(sinfo.visiting) == 0 {
+		delete(sinfo.searches.searches, sinfo.dest)
+		sinfo.callback(nil, errors.New("search timeout"))
+		sinfo.searches.router.core.log.Debugln("Search timeout:", &sinfo.dest, sinfo.send, sinfo.recv)
 	}
 }
 
@@ -114,12 +121,8 @@ func (sinfo *searchInfo) retryVisiting(smk searchMapKey) {
 	if sfo := sinfo.searches.searches[sinfo.dest]; sfo != sinfo {
 		return // search already over
 	}
-	if _, isIn := sinfo.visited[smk]; isIn {
-		delete(sinfo.visiting, smk)
-		return // already visited this target before
-	}
 	if svv, isIn := sinfo.visiting[smk]; isIn {
-		if svv.count <= search_MAX_RETRY {
+		if _, isIn = sinfo.visited[smk]; !isIn && svv.count <= search_MAX_RETRY {
 			rq := dhtReqKey{svv.info.key, sinfo.dest}
 			sinfo.searches.router.dht.addCallback(&rq, func(res *dhtRes) {
 				sinfo.handleDHTRes(smk, res)
@@ -133,13 +136,7 @@ func (sinfo *searchInfo) retryVisiting(smk searchMapKey) {
 			})
 			sinfo.searches.router.core.log.Debugln("Sending search lookup:", &sinfo.dest, svv.info.getNodeID(), sinfo.send, sinfo.recv, len(sinfo.visiting))
 		} else {
-			delete(sinfo.visiting, smk)
-			sinfo.visited[smk] = struct{}{}
-			if len(sinfo.visiting) == 0 {
-				delete(sinfo.searches.searches, sinfo.dest)
-				sinfo.callback(nil, errors.New("search timeout"))
-				sinfo.searches.router.core.log.Debugln("Search timeout:", &sinfo.dest, sinfo.send, sinfo.recv)
-			}
+			sinfo.removeFromSearch(smk)
 		}
 	}
 }
