@@ -24,7 +24,7 @@ import (
 )
 
 const search_MAX_RESULTS = 16
-const search_MAX_RETRY = 5
+const search_MAX_RETRY = 3
 
 type searchMapKey struct {
 	key    crypto.BoxPubKey
@@ -43,7 +43,6 @@ type searchInfo struct {
 	searches *searches
 	dest     crypto.NodeID
 	mask     crypto.NodeID
-	timer    *time.Timer
 	visited  map[searchMapKey]struct{} // key+coord pairs visited so far
 	visiting map[searchMapKey]*searchVisitingVal
 	callback func(*sessionInfo, error)
@@ -99,9 +98,7 @@ func (sinfo *searchInfo) handleDHTRes(smk searchMapKey, res *dhtRes) {
 			}
 			// Use results to start an additional search thread
 			infos := sinfo.getAllowedInfos(res)
-			if len(infos) > 0 {
-				sinfo.addToSearch(infos)
-			}
+			sinfo.addToSearch(infos)
 		}
 		sinfo.removeFromSearch(smk)
 	}
@@ -129,7 +126,7 @@ func (sinfo *searchInfo) retryVisiting(smk searchMapKey) {
 			})
 			sinfo.searches.router.dht.ping(svv.info, &sinfo.dest)
 			sinfo.send++
-			delay := time.Millisecond * time.Duration(rand.Intn(100)*(1<<svv.count))
+			delay := time.Millisecond * time.Duration(rand.Intn(1000)*(1<<svv.count))
 			svv.count++
 			svv.timer = time.AfterFunc(delay, func() {
 				sinfo.searches.router.Act(nil, func() { sinfo.retryVisiting(smk) })
