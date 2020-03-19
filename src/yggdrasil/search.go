@@ -16,13 +16,14 @@ package yggdrasil
 
 import (
 	"errors"
-	"math/rand"
 	"sort"
 	"time"
 
 	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
 )
 
+const search_TIMEOUT = 3 * time.Second
+const search_RETRY_TIME = 100 * time.Millisecond
 const search_MAX_RESULTS = 16
 const search_MAX_RETRY = 3
 
@@ -32,9 +33,8 @@ type searchMapKey struct {
 }
 
 type searchVisitingVal struct {
-	info  *dhtInfo
-	count uint
-	timer *time.Timer
+	smk  searchMapKey
+	info *dhtInfo
 }
 
 // Information about an ongoing search.
@@ -43,8 +43,9 @@ type searchInfo struct {
 	searches *searches
 	dest     crypto.NodeID
 	mask     crypto.NodeID
+	timer    *time.Timer
 	visited  map[searchMapKey]struct{} // key+coord pairs visited so far
-	visiting map[searchMapKey]*searchVisitingVal
+	visiting []*searchVisitingVal
 	callback func(*sessionInfo, error)
 	// TODO context.Context for timeout and cancellation
 	send uint64 // log number of requests sent
@@ -100,40 +101,48 @@ func (sinfo *searchInfo) handleDHTRes(smk searchMapKey, res *dhtRes) {
 			infos := sinfo.getAllowedInfos(res)
 			sinfo.addToSearch(infos)
 		}
-		sinfo.removeFromSearch(smk)
 	}
 }
 
-func (sinfo *searchInfo) removeFromSearch(smk searchMapKey) {
-	delete(sinfo.visiting, smk)
-	sinfo.visited[smk] = struct{}{}
-	if len(sinfo.visiting) == 0 {
-		delete(sinfo.searches.searches, sinfo.dest)
-		sinfo.callback(nil, errors.New("search timeout"))
-		sinfo.searches.router.core.log.Debugln("Search timeout:", &sinfo.dest, sinfo.send, sinfo.recv)
+func (sinfo *searchInfo) sendSearchLookup(svv *searchVisitingVal) {
+	rq := dhtReqKey{svv.info.key, sinfo.dest}
+	sinfo.searches.router.dht.addCallback(&rq, func(res *dhtRes) {
+		sinfo.handleDHTRes(svv.smk, res)
+	})
+	sinfo.searches.router.dht.ping(svv.info, &sinfo.dest)
+	sinfo.send++
+	if sinfo.timer != nil {
+		sinfo.timer.Stop()
 	}
+	sinfo.timer = time.AfterFunc(search_RETRY_TIME, func() {
+		sinfo.searches.router.Act(nil, func() { sinfo.retryVisiting() })
+	})
+	sinfo.searches.router.core.log.Debugln("Sending search lookup:", &sinfo.dest, svv.info.getNodeID(), sinfo.send, sinfo.recv, len(sinfo.visiting))
 }
 
-func (sinfo *searchInfo) retryVisiting(smk searchMapKey) {
+func (sinfo *searchInfo) retryVisiting() {
 	if sfo := sinfo.searches.searches[sinfo.dest]; sfo != sinfo {
 		return // search already over
 	}
-	if svv, isIn := sinfo.visiting[smk]; isIn {
-		if _, isIn = sinfo.visited[smk]; !isIn && svv.count <= search_MAX_RETRY {
-			rq := dhtReqKey{svv.info.key, sinfo.dest}
-			sinfo.searches.router.dht.addCallback(&rq, func(res *dhtRes) {
-				sinfo.handleDHTRes(smk, res)
-			})
-			sinfo.searches.router.dht.ping(svv.info, &sinfo.dest)
-			sinfo.send++
-			delay := time.Millisecond * time.Duration(rand.Intn(1000)*(1<<svv.count))
-			svv.count++
-			svv.timer = time.AfterFunc(delay, func() {
-				sinfo.searches.router.Act(nil, func() { sinfo.retryVisiting(smk) })
-			})
-			sinfo.searches.router.core.log.Debugln("Sending search lookup:", &sinfo.dest, svv.info.getNodeID(), sinfo.send, sinfo.recv, len(sinfo.visiting))
+	for {
+		if len(sinfo.visiting) > 0 {
+			svv := sinfo.visiting[0]
+			sinfo.visiting = sinfo.visiting[1:]
+			if _, isIn := sinfo.visited[svv.smk]; isIn {
+				continue
+			}
+			sinfo.sendSearchLookup(svv)
+			break
 		} else {
-			sinfo.removeFromSearch(smk)
+			if sinfo.timer != nil {
+				sinfo.timer.Stop()
+			}
+			sinfo.timer = time.AfterFunc(search_TIMEOUT, func() {
+				delete(sinfo.searches.searches, sinfo.dest)
+				sinfo.callback(nil, errors.New("search timeout"))
+				sinfo.searches.router.core.log.Debugln("Search timeout:", &sinfo.dest, sinfo.send, sinfo.recv)
+			})
+			break
 		}
 	}
 }
@@ -162,17 +171,33 @@ func (sinfo *searchInfo) getAllowedInfos(res *dhtRes) []*dhtInfo {
 }
 
 func (sinfo *searchInfo) addToSearch(infos []*dhtInfo) {
+	m := make(map[searchMapKey]*searchVisitingVal)
+	for _, svv := range sinfo.visiting {
+		if _, isIn := sinfo.visited[svv.smk]; isIn {
+			continue
+		}
+		m[svv.smk] = svv
+	}
 	for _, info := range infos {
 		smk := searchMapKey{info.key, string(info.coords)}
 		if _, isIn := sinfo.visited[smk]; isIn {
 			continue
-		} else if _, isIn := sinfo.visiting[smk]; isIn {
+		} else if _, isIn := m[smk]; isIn {
 			continue
 		}
-		svv := &searchVisitingVal{info: info}
-		sinfo.visiting[smk] = svv
-		sinfo.retryVisiting(smk)
+		svv := &searchVisitingVal{smk, info}
+		m[smk] = svv
+		//sinfo.sendSearchLookup(svv)
 	}
+	sinfo.visiting = sinfo.visiting[:0]
+	for _, svv := range m {
+		sinfo.visiting = append(sinfo.visiting, svv)
+	}
+	sort.SliceStable(sinfo.visiting, func(i, j int) bool {
+		// Should return true if i is closer to the destination than j
+		return dht_ordered(&sinfo.dest, sinfo.visiting[i].info.getNodeID(), sinfo.visiting[j].info.getNodeID())
+	})
+	sinfo.retryVisiting()
 }
 
 // Initially start a search
@@ -192,7 +217,6 @@ func (s *searches) newIterSearch(dest *crypto.NodeID, mask *crypto.NodeID, callb
 	// TODO remove this function, just do it all in createSearch
 	sinfo := s.createSearch(dest, mask, callback)
 	sinfo.visited = make(map[searchMapKey]struct{})
-	sinfo.visiting = make(map[searchMapKey]*searchVisitingVal)
 	return sinfo
 }
 
