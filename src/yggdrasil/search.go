@@ -85,20 +85,19 @@ func (s *searches) createSearch(dest *crypto.NodeID, mask *crypto.NodeID, callba
 // Checks if there's an ongoing search related to a dhtRes.
 // If there is, it adds the response info to the search and triggers a new search step.
 // If there's no ongoing search, or we if the dhtRes finished the search (it was from the target node), then don't do anything more.
-func (sinfo *searchInfo) handleDHTRes(res *dhtRes) {
+func (sinfo *searchInfo) handleDHTRes(smk searchMapKey, res *dhtRes) {
 	if sinfo != sinfo.searches.searches[sinfo.dest] {
 		// Search already over
 		return
 	}
 	if res != nil {
+		if svv, isIn := sinfo.visiting[smk]; isIn {
+			svv.timer.Stop()
+		}
+		delete(sinfo.visiting, smk)
 		sinfo.recv++
-		smk := searchMapKey{res.Key, string(res.Coords)}
 		if _, isIn := sinfo.visited[smk]; !isIn {
 			sinfo.visited[smk] = struct{}{}
-			if svv, isIn := sinfo.visiting[smk]; isIn {
-				svv.timer.Stop()
-				delete(sinfo.visiting, smk)
-			}
 			if sinfo.checkDHTRes(res) {
 				return // Search finished successfully
 			}
@@ -122,7 +121,9 @@ func (sinfo *searchInfo) retryVisiting(smk searchMapKey) {
 	if svv, isIn := sinfo.visiting[smk]; isIn {
 		if svv.count <= search_MAX_RETRY {
 			rq := dhtReqKey{svv.info.key, sinfo.dest}
-			sinfo.searches.router.dht.addCallback(&rq, sinfo.handleDHTRes)
+			sinfo.searches.router.dht.addCallback(&rq, func(res *dhtRes) {
+				sinfo.handleDHTRes(smk, res)
+			})
 			sinfo.searches.router.dht.ping(svv.info, &sinfo.dest)
 			sinfo.send++
 			delay := time.Millisecond * time.Duration(rand.Intn(100)*(1<<svv.count))
