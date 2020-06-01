@@ -259,17 +259,13 @@ func (m *Multicast) _announce() {
 			continue
 		}
 		// Find the interface that matches the listener
-		if intf, err := net.InterfaceByName(name); err == nil {
-			if addrs, err := intf.Addrs(); err == nil {
-				// Loop through the addresses attached to that listener and see if any
-				// of them match the current address of the listener
-				for _, addr := range addrs {
-					if ip, _, err := net.ParseCIDR(addr.String()); err == nil {
-						// Does the interface address match our listener address?
-						if ip.Equal(listenaddr.IP) {
-							found = true
-							break
-						}
+		if info, ok := m._interfaces[name]; ok {
+			for _, addr := range info.addrs {
+				if ip, _, err := net.ParseCIDR(addr.String()); err == nil {
+					// Does the interface address match our listener address?
+					if ip.Equal(listenaddr.IP) {
+						found = true
+						break
 					}
 				}
 			}
