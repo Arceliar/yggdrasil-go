@@ -136,14 +136,19 @@ func (x *switchLocator) isAncestorOf(y *switchLocator) bool {
 
 // Information about a peer, used by the switch to build the tree and eventually make routing decisions.
 type peerInfo struct {
-	key     crypto.SigPubKey      // ID of this peer
-	locator switchLocator         // Should be able to respond with signatures upon request
-	degree  uint64                // Self-reported degree
-	time    time.Time             // Time this node was last seen
-	faster  map[switchPort]uint64 // Counter of how often a node is faster than the current parent, penalized extra if slower
-	port    switchPort            // Interface number of this peer
-	msg     switchMsg             // The wire switchMsg used
-	blocked bool                  // True if the link is blocked, used to avoid parenting a blocked link
+	key        crypto.SigPubKey      // ID of this peer
+	locator    switchLocator         // Should be able to respond with signatures upon request
+	degree     uint64                // Self-reported degree
+	time       time.Time             // Time this node was last seen
+	faster     map[switchPort]uint64 // Counter of how often a node is faster than the current parent, penalized extra if slower
+	port       switchPort            // Interface number of this peer
+	msg        switchMsg             // The wire switchMsg used
+	readBlock  bool                  // True if the link notified us of a read that blocked too long
+	writeBlock bool                  // True of the link notified us of a write that blocked too long
+}
+
+func (pinfo *peerInfo) blocked() bool {
+	return pinfo.readBlock || pinfo.writeBlock
 }
 
 // This is just a uint64 with a named type for clarity reasons.
@@ -250,15 +255,19 @@ func (t *switchTable) _cleanRoot() {
 }
 
 // Blocks and, if possible, unparents a peer
-func (t *switchTable) blockPeer(from phony.Actor, port switchPort) {
+func (t *switchTable) blockPeer(from phony.Actor, port switchPort, isWrite bool) {
 	t.Act(from, func() {
 		peer, isIn := t.data.peers[port]
-		if !isIn || peer.blocked {
+		switch {
+		case isIn && !isWrite && !peer.readBlock:
+			peer.readBlock = true
+		case isIn && isWrite && !peer.writeBlock:
+			peer.writeBlock = true
+		default:
 			return
 		}
-		peer.blocked = true
 		t.data.peers[port] = peer
-		t._updateTable()
+		defer t._updateTable()
 		if port != t.parent {
 			return
 		}
@@ -273,13 +282,17 @@ func (t *switchTable) blockPeer(from phony.Actor, port switchPort) {
 	})
 }
 
-func (t *switchTable) unblockPeer(from phony.Actor, port switchPort) {
+func (t *switchTable) unblockPeer(from phony.Actor, port switchPort, isWrite bool) {
 	t.Act(from, func() {
 		peer, isIn := t.data.peers[port]
-		if !isIn || !peer.blocked {
+		switch {
+		case isIn && !isWrite && peer.readBlock:
+			peer.readBlock = false
+		case isIn && isWrite && peer.writeBlock:
+			peer.writeBlock = false
+		default:
 			return
 		}
-		peer.blocked = false
 		t.data.peers[port] = peer
 		t._updateTable()
 	})
@@ -422,7 +435,8 @@ func (t *switchTable) _handleMsg(msg *switchMsg, fromPort switchPort, reprocessi
 	if reprocessing {
 		sender.faster = oldSender.faster
 		sender.time = oldSender.time
-		sender.blocked = oldSender.blocked
+		sender.readBlock = oldSender.readBlock
+		sender.writeBlock = oldSender.writeBlock
 	} else {
 		sender.faster = make(map[switchPort]uint64, len(oldSender.faster))
 		for port, peer := range t.data.peers {
@@ -445,7 +459,7 @@ func (t *switchTable) _handleMsg(msg *switchMsg, fromPort switchPort, reprocessi
 			}
 		}
 	}
-	if sender.blocked != oldSender.blocked {
+	if sender.blocked() != oldSender.blocked() {
 		doUpdate = true
 	}
 	// Update sender
@@ -485,10 +499,10 @@ func (t *switchTable) _handleMsg(msg *switchMsg, fromPort switchPort, reprocessi
 	case sender.faster[t.parent] >= switch_faster_threshold:
 		// The is reliably faster than the current parent.
 		updateRoot = true
-	case !sender.blocked && oldParent.blocked:
+	case !sender.blocked() && oldParent.blocked():
 		// Replace a blocked parent
 		updateRoot = true
-	case reprocessing && sender.blocked && !oldParent.blocked:
+	case reprocessing && sender.blocked() && !oldParent.blocked():
 		// Don't replace an unblocked parent when reprocessing
 	case reprocessing && sender.faster[t.parent] > oldParent.faster[sender.port]:
 		// The sender seems to be reliably faster than the current parent, so switch to them instead.
@@ -546,7 +560,7 @@ func (t *switchTable) _updateTable() {
 	}
 	newTable._init()
 	for _, pinfo := range t.data.peers {
-		if pinfo.blocked || pinfo.locator.root != newTable.self.root {
+		if pinfo.blocked() || pinfo.locator.root != newTable.self.root {
 			continue
 		}
 		loc := pinfo.locator.clone()

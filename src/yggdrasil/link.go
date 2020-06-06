@@ -64,8 +64,9 @@ type link struct {
 	keepAliveTimer *time.Timer // Fires to send keep-alive traffic
 	stallTimer     *time.Timer // Fires to signal that no incoming traffic (including keep-alive) has been seen
 	closeTimer     *time.Timer // Fires when the link has been idle so long we need to close it
-	isSending      bool        // True between a notifySending and a notifySent
-	blocked        bool        // True if we've blocked the peer in the switch
+	readUnblocked  bool        // True if we've sent a read message unblocking this peer in the switch
+	writeUnblocked bool        // True if we've sent a write message unblocking this peer in the swithc
+	shutdown       bool        // True if we're shutting down, avoids sending some messages that could race with new peers being crated in the same port
 }
 
 type linkOptions struct {
@@ -285,7 +286,10 @@ func (intf *link) handler() error {
 	}
 	defer func() {
 		// More cleanup can go here
-		intf.peer.Act(nil, intf.peer._removeSelf)
+		intf.Act(nil, func() {
+			intf.shutdown = true
+			intf.peer.Act(intf, intf.peer._removeSelf)
+		})
 	}()
 	themAddr := address.AddrForNodeID(crypto.GetNodeID(&intf.info.box))
 	themAddrString := net.IP(themAddr[:]).String()
@@ -385,7 +389,6 @@ const (
 // notify the intf that we're currently sending
 func (intf *link) notifySending(size int) {
 	intf.Act(&intf.writer, func() {
-		intf.isSending = true
 		intf.sendTimer = time.AfterFunc(sendTime, intf.notifyBlockedSend)
 		if intf.keepAliveTimer != nil {
 			intf.keepAliveTimer.Stop()
@@ -400,10 +403,14 @@ func (intf *link) notifySending(size int) {
 // through other links, if alternatives exist
 func (intf *link) notifyBlockedSend() {
 	intf.Act(nil, func() {
-		if intf.sendTimer != nil && !intf.blocked {
+		if intf.sendTimer != nil {
 			//As far as we know, we're still trying to send, and the timer fired.
-			intf.blocked = true
-			intf.links.core.switchTable.blockPeer(intf, intf.peer.port)
+			intf.sendTimer.Stop()
+			intf.sendTimer = nil
+			if !intf.shutdown && intf.writeUnblocked {
+				intf.writeUnblocked = false
+				intf.links.core.switchTable.blockPeer(intf, intf.peer.port, true)
+			}
 		}
 	})
 }
@@ -421,9 +428,12 @@ func (intf *link) notifySent(size int) {
 			intf.keepAliveTimer = nil
 		}
 		intf._notifyIdle()
-		intf.isSending = false
 		if size > 0 && intf.stallTimer == nil {
 			intf.stallTimer = time.AfterFunc(stallTime, intf.notifyStalled)
+		}
+		if !intf.shutdown && !intf.writeUnblocked {
+			intf.writeUnblocked = true
+			intf.links.core.switchTable.unblockPeer(intf, intf.peer.port, true)
 		}
 	})
 }
@@ -439,9 +449,9 @@ func (intf *link) notifyStalled() {
 		if intf.stallTimer != nil {
 			intf.stallTimer.Stop()
 			intf.stallTimer = nil
-			if !intf.blocked {
-				intf.blocked = true
-				intf.links.core.switchTable.blockPeer(intf, intf.peer.port)
+			if !intf.shutdown && intf.readUnblocked {
+				intf.readUnblocked = false
+				intf.links.core.switchTable.blockPeer(intf, intf.peer.port, false)
 			}
 		}
 	})
@@ -467,9 +477,9 @@ func (intf *link) notifyRead(size int) {
 		if size > 0 && intf.keepAliveTimer == nil {
 			intf.keepAliveTimer = time.AfterFunc(keepAliveTime, intf.notifyDoKeepAlive)
 		}
-		if intf.blocked {
-			intf.blocked = false
-			intf.links.core.switchTable.unblockPeer(intf, intf.peer.port)
+		if !intf.shutdown && !intf.readUnblocked {
+			intf.readUnblocked = true
+			intf.links.core.switchTable.unblockPeer(intf, intf.peer.port, false)
 		}
 	})
 }
