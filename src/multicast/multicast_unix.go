@@ -1,9 +1,12 @@
-// +build linux netbsd freebsd openbsd dragonflybsd
+// +build netbsd freebsd openbsd dragonflybsd
 
 package multicast
 
-import "syscall"
-import "golang.org/x/sys/unix"
+import (
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
 
 func (m *Multicast) _multicastStarted() {
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"regexp"
 	"time"
 
 	"github.com/Arceliar/phony"
@@ -29,6 +28,7 @@ type Multicast struct {
 	listeners   map[string]*listenerInfo
 	listenPort  uint16
 	isOpen      bool
+	stop        chan struct{}
 	_interfaces map[string]interfaceInfo
 }
 
@@ -75,6 +75,7 @@ func (m *Multicast) _start() error {
 	if len(m.config.GetCurrent().MulticastInterfaces) == 0 {
 		return nil
 	}
+	m.stop = make(chan struct{})
 	m.log.Infoln("Starting multicast module")
 	addr, err := net.ResolveUDPAddr("udp", m.groupAddr)
 	if err != nil {
@@ -122,6 +123,7 @@ func (m *Multicast) Stop() error {
 
 func (m *Multicast) _stop() error {
 	m.log.Infoln("Stopping multicast module")
+	close(m.stop)
 	m.isOpen = false
 	if m.sock != nil {
 		m.sock.Close()
@@ -155,70 +157,15 @@ func (m *Multicast) _updateConfig(config *config.NodeConfig) {
 	m.log.Debugln("Reloaded multicast configuration successfully")
 }
 
-func (m *Multicast) _updateInterfaces() {
-	interfaces := make(map[string]interfaceInfo)
-	intfs := m.getAllowedInterfaces()
-	for _, intf := range intfs {
-		addrs, err := intf.Addrs()
-		if err != nil {
-			m.log.Warnf("Failed up get addresses for interface %s: %s", intf.Name, err)
-			continue
-		}
-		interfaces[intf.Name] = interfaceInfo{
-			iface: intf,
-			addrs: addrs,
-		}
-	}
-	m._interfaces = interfaces
-}
-
 func (m *Multicast) Interfaces() map[string]net.Interface {
 	interfaces := make(map[string]net.Interface)
 	phony.Block(m, func() {
 		for _, info := range m._interfaces {
-			interfaces[info.iface.Name] = info.iface
+			if len(info.addrs) > 0 {
+				interfaces[info.iface.Name] = info.iface
+			}
 		}
 	})
-	return interfaces
-}
-
-// getAllowedInterfaces returns the currently known/enabled multicast interfaces.
-func (m *Multicast) getAllowedInterfaces() map[string]net.Interface {
-	interfaces := make(map[string]net.Interface)
-	// Get interface expressions from config
-	current := m.config.GetCurrent()
-	exprs := current.MulticastInterfaces
-	// Ask the system for network interfaces
-	allifaces, err := net.Interfaces()
-	if err != nil {
-		panic(err)
-	}
-	// Work out which interfaces to announce on
-	for _, iface := range allifaces {
-		if iface.Flags&net.FlagUp == 0 {
-			// Ignore interfaces that are down
-			continue
-		}
-		if iface.Flags&net.FlagMulticast == 0 {
-			// Ignore non-multicast interfaces
-			continue
-		}
-		if iface.Flags&net.FlagPointToPoint != 0 {
-			// Ignore point-to-point interfaces
-			continue
-		}
-		for _, expr := range exprs {
-			// Compile each regular expression
-			e, err := regexp.Compile(expr)
-			if err != nil {
-				panic(err)
-			}
-			// Does the interface match the regular expression? Store it if so
-			if e.MatchString(iface.Name) {
-				interfaces[iface.Name] = iface
-			}
-		}
-	}
 	return interfaces
 }
 
@@ -246,7 +193,7 @@ func (m *Multicast) _announce() {
 		}
 		// If the interface is no longer visible on the system then stop the
 		// listener, as another one will be started further down
-		if _, ok := m._interfaces[name]; !ok {
+		if intf, ok := m._interfaces[name]; !ok || len(intf.addrs) == 0 {
 			stop()
 			continue
 		}
