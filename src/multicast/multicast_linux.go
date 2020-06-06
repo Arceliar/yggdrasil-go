@@ -124,10 +124,8 @@ func (m *Multicast) _multicastStarted() {
 						if info, ok := interfaces[name]; ok {
 							// We need to ParseCIDR the Addr, so use an IPNet
 							info.addrs = append([]net.Addr(nil), info.addrs...) // copy
-							info.addrs = append(info.addrs, &net.IPNet{
-								IP:   change.LinkAddress.IP,
-								Mask: net.CIDRMask(64, 128),
-							})
+							addr := change.LinkAddress
+							info.addrs = append(info.addrs, &addr)
 							interfaces[name] = info
 						}
 					} else {
@@ -135,13 +133,9 @@ func (m *Multicast) _multicastStarted() {
 						if info, ok := interfaces[name]; ok {
 							oldAddrs := info.addrs
 							info.addrs = nil
-							changedAddr := net.IPNet{
-								IP:   change.LinkAddress.IP,
-								Mask: net.CIDRMask(64, 128),
-							}
-							changedString := changedAddr.String()
+							changeString := change.LinkAddress.String()
 							for _, addr := range oldAddrs {
-								if addr.String() == changedString {
+								if addr.String() == changeString {
 									continue
 								}
 								info.addrs = append(info.addrs, addr)
