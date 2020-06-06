@@ -116,9 +116,10 @@ func (m *Multicast) _multicastStarted() {
 					m.Act(nil, func() {
 						m.log.Debugln("Multicast address", change.LinkAddress.IP, "on", name, "enabled")
 						if info, ok := m._interfaces[name]; ok {
-							info.addrs = append(info.addrs, &net.IPAddr{
+							// We need to ParseCIDR the Addr, so use an IPNet
+							info.addrs = append(info.addrs, &net.IPNet{
 								IP:   change.LinkAddress.IP,
-								Zone: name,
+								Mask: net.CIDRMask(64, 128),
 							})
 							m._interfaces[name] = info
 						}
