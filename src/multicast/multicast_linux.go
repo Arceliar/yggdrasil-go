@@ -104,6 +104,7 @@ func (m *Multicast) _multicastStarted() {
 				select {
 				case change := <-linkChanges:
 					attrs := change.Attrs()
+					defer updateAddrs(attrs.Index)
 					add := true
 					add = add && attrs.Flags&net.FlagUp != 0
 					add = add && attrs.Flags&net.FlagMulticast != 0
@@ -147,9 +148,9 @@ func (m *Multicast) _multicastStarted() {
 						//delete(indexToAddrs, attrs.Index) // TODO? Or process messages individually?
 						delete(interfaces, attrs.Name)
 					}
-					updateAddrs(attrs.Index)
 
 				case change := <-addrChanges:
+					defer updateAddrs(change.LinkIndex)
 					add := true
 					add = add && change.NewAddr
 					add = add && change.LinkAddress.IP.IsLinkLocalUnicast()
@@ -175,7 +176,6 @@ func (m *Multicast) _multicastStarted() {
 							}
 						}
 					}
-					updateAddrs(change.LinkIndex)
 
 				case <-linkClose:
 					return nil
