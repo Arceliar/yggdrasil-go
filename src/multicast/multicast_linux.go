@@ -39,7 +39,7 @@ func (m *Multicast) _multicastStarted() {
 	}
 
 	go func() {
-		time.Sleep(time.Second)
+		time.Sleep(time.Second) // FIXME this is bad practice
 		if err := netlink.AddrSubscribeWithOptions(addrChanges, addrClose, addrSubscribeOptions); err != nil {
 			panic(err)
 		}
@@ -50,7 +50,8 @@ func (m *Multicast) _multicastStarted() {
 	go func() {
 		defer m.log.Debugln("No longer listening for netlink interface changes")
 
-		indexToIntf := map[int]string{}
+		indexToIntf := make(map[int]string)
+		indexToAddrs := make(map[int]map[string]*net.IPNet)
 
 		for {
 			current := m.config.GetCurrent()
@@ -64,6 +65,42 @@ func (m *Multicast) _multicastStarted() {
 				for k, v := range oldInterfaces {
 					interfaces[k] = v
 				}
+
+				updateAddrs := func(linkIndex int) {
+					name, ok := indexToIntf[linkIndex]
+					if !ok {
+						return
+					}
+					info, infoOk := interfaces[name]
+					if !infoOk {
+						return // Should this ever happen?
+					}
+					newAddrs := indexToAddrs[linkIndex]
+					addrs := make([]net.Addr, 0, len(newAddrs))
+					for _, addr := range addrs {
+						addrs = append(addrs, addr)
+					}
+					info.addrs = addrs
+					interfaces[name] = info
+					// The rest is just logging, and should probably be done in the multicast actor instead
+					oldAddrs := make(map[string]net.Addr, len(info.addrs))
+					for _, addr := range info.addrs {
+						oldAddrs[addr.String()] = addr
+					}
+					// Log any new addresses added
+					for addrString, newAddr := range newAddrs {
+						if _, isIn := oldAddrs[addrString]; !isIn {
+							m.log.Debugln("Multicast address", newAddr.String(), "on", name, "enabled")
+						}
+					}
+					// Log any old addresses removed
+					for addrString, oldAddr := range oldAddrs {
+						if _, isIn := newAddrs[addrString]; !isIn {
+							m.log.Debugln("Multicast address", oldAddr.String(), "on", name, "disabled")
+						}
+					}
+				}
+
 				select {
 				case change := <-linkChanges:
 					attrs := change.Attrs()
@@ -104,45 +141,41 @@ func (m *Multicast) _multicastStarted() {
 								}
 							}
 						}()
-					} else {
-						delete(indexToIntf, attrs.Index)
+					} else if _, isIn := indexToIntf[attrs.Index]; isIn {
 						m.log.Debugln("Multicast on interface", attrs.Name, "disabled")
+						delete(indexToIntf, attrs.Index)
+						//delete(indexToAddrs, attrs.Index) // TODO? Or process messages individually?
 						delete(interfaces, attrs.Name)
 					}
+					updateAddrs(attrs.Index)
 
 				case change := <-addrChanges:
-					name, ok := indexToIntf[change.LinkIndex]
-					if !ok {
-						break
-					}
 					add := true
 					add = add && change.NewAddr
 					add = add && change.LinkAddress.IP.IsLinkLocalUnicast()
-
 					if add {
-						m.log.Debugln("Multicast address", change.LinkAddress.IP, "on", name, "enabled")
-						if info, ok := interfaces[name]; ok {
-							// We need to ParseCIDR the Addr, so use an IPNet
-							info.addrs = append([]net.Addr(nil), info.addrs...) // copy
-							addr := change.LinkAddress
-							info.addrs = append(info.addrs, &addr)
-							interfaces[name] = info
+						if _, isIn := indexToAddrs[change.LinkIndex]; !isIn {
+							indexToAddrs[change.LinkIndex] = make(map[string]*net.IPNet)
+						}
+						changeString := change.LinkAddress.String()
+						if _, isIn := indexToAddrs[change.LinkIndex][changeString]; !isIn {
+							ipNet := change.LinkAddress
+							indexToAddrs[change.LinkIndex][changeString] = &ipNet
+							//defer updateAddrs(change.LinkIndex)
 						}
 					} else {
-						m.log.Debugln("Multicast address", change.LinkAddress.IP, "on", name, "disabled")
-						if info, ok := interfaces[name]; ok {
-							oldAddrs := info.addrs
-							info.addrs = nil
+						if idxAddrs, isIn := indexToAddrs[change.LinkIndex]; isIn {
 							changeString := change.LinkAddress.String()
-							for _, addr := range oldAddrs {
-								if addr.String() == changeString {
-									continue
+							if _, isIn := idxAddrs[changeString]; isIn {
+								delete(idxAddrs, changeString)
+								if len(idxAddrs) == 0 {
+									delete(indexToAddrs, change.LinkIndex)
 								}
-								info.addrs = append(info.addrs, addr)
+								//defer updateAddrs(change.LinkIndex)
 							}
-							interfaces[name] = info
 						}
 					}
+					updateAddrs(change.LinkIndex)
 
 				case <-linkClose:
 					return nil
