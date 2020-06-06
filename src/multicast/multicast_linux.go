@@ -77,7 +77,7 @@ func (m *Multicast) _multicastStarted() {
 					}
 					newAddrs := indexToAddrs[linkIndex]
 					addrs := make([]net.Addr, 0, len(newAddrs))
-					for _, addr := range addrs {
+					for _, addr := range newAddrs {
 						addrs = append(addrs, addr)
 					}
 					info.addrs = addrs
