@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Arceliar/phony"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -54,95 +55,121 @@ func (m *Multicast) _multicastStarted() {
 		for {
 			current := m.config.GetCurrent()
 			exprs := current.MulticastInterfaces
-
-			select {
-			case change := <-linkChanges:
-				attrs := change.Attrs()
-				add := true
-				add = add && attrs.Flags&net.FlagUp != 0
-				add = add && attrs.Flags&net.FlagMulticast != 0
-				add = add && attrs.Flags&net.FlagPointToPoint == 0
-
-				if add {
-					match := false
-					for _, expr := range exprs {
-						e, err := regexp.Compile(expr)
-						if err != nil {
-							panic(err)
-						}
-						if e.MatchString(attrs.Name) {
-							match = true
-							break
-						}
-					}
-					add = add && match
+			f := func() map[string]interfaceInfo {
+				var oldInterfaces map[string]interfaceInfo
+				phony.Block(m, func() {
+					oldInterfaces = m._interfaces
+				})
+				interfaces := make(map[string]interfaceInfo, len(oldInterfaces)+1)
+				for k, v := range oldInterfaces {
+					interfaces[k] = v
 				}
+				select {
+				case change := <-linkChanges:
+					attrs := change.Attrs()
+					add := true
+					add = add && attrs.Flags&net.FlagUp != 0
+					add = add && attrs.Flags&net.FlagMulticast != 0
+					add = add && attrs.Flags&net.FlagPointToPoint == 0
 
-				if add {
-					indexToIntf[attrs.Index] = attrs.Name
-					m.Act(nil, func() {
-						iface, err := net.InterfaceByIndex(attrs.Index)
-						if err != nil {
-							return
-						}
-						m.log.Debugln("Multicast on interface", attrs.Name, "enabled")
-						if info, ok := m._interfaces[attrs.Name]; ok {
-							info.iface = *iface
-							m._interfaces[attrs.Name] = info
-						} else {
-							m._interfaces[attrs.Name] = interfaceInfo{
-								iface: *iface,
+					if add {
+						match := false
+						for _, expr := range exprs {
+							e, err := regexp.Compile(expr)
+							if err != nil {
+								panic(err)
+							}
+							if e.MatchString(attrs.Name) {
+								match = true
+								break
 							}
 						}
-					})
-				} else {
-					delete(indexToIntf, attrs.Index)
-					m.Act(nil, func() {
+						add = add && match
+					}
+
+					if add {
+						indexToIntf[attrs.Index] = attrs.Name
+						func() {
+							iface, err := net.InterfaceByIndex(attrs.Index)
+							if err != nil {
+								return
+							}
+							m.log.Debugln("Multicast on interface", attrs.Name, "enabled")
+							if info, ok := interfaces[attrs.Name]; ok {
+								info.iface = *iface
+								interfaces[attrs.Name] = info
+							} else {
+								interfaces[attrs.Name] = interfaceInfo{
+									iface: *iface,
+								}
+							}
+						}()
+					} else {
+						delete(indexToIntf, attrs.Index)
 						m.log.Debugln("Multicast on interface", attrs.Name, "disabled")
-						delete(m._interfaces, attrs.Name)
-					})
-				}
+						delete(interfaces, attrs.Name)
+					}
 
-			case change := <-addrChanges:
-				name, ok := indexToIntf[change.LinkIndex]
-				if !ok {
-					break
-				}
-				add := true
-				add = add && change.NewAddr
-				add = add && change.LinkAddress.IP.IsLinkLocalUnicast()
+				case change := <-addrChanges:
+					name, ok := indexToIntf[change.LinkIndex]
+					if !ok {
+						break
+					}
+					add := true
+					add = add && change.NewAddr
+					add = add && change.LinkAddress.IP.IsLinkLocalUnicast()
 
-				if add {
-					m.Act(nil, func() {
+					if add {
 						m.log.Debugln("Multicast address", change.LinkAddress.IP, "on", name, "enabled")
-						if info, ok := m._interfaces[name]; ok {
+						if info, ok := interfaces[name]; ok {
 							// We need to ParseCIDR the Addr, so use an IPNet
+							info.addrs = append([]net.Addr(nil), info.addrs...) // copy
 							info.addrs = append(info.addrs, &net.IPNet{
 								IP:   change.LinkAddress.IP,
 								Mask: net.CIDRMask(64, 128),
 							})
-							m._interfaces[name] = info
+							interfaces[name] = info
 						}
-					})
-				} else {
-					m.Act(nil, func() {
+					} else {
 						m.log.Debugln("Multicast address", change.LinkAddress.IP, "on", name, "disabled")
-						if info, ok := m._interfaces[name]; ok {
+						if info, ok := interfaces[name]; ok {
+							oldAddrs := info.addrs
 							info.addrs = nil
-							m._interfaces[name] = info
+							changedAddr := net.IPNet{
+								IP:   change.LinkAddress.IP,
+								Mask: net.CIDRMask(64, 128),
+							}
+							changedString := changedAddr.String()
+							for _, addr := range oldAddrs {
+								if addr.String() == changedString {
+									continue
+								}
+								info.addrs = append(info.addrs, addr)
+							}
+							interfaces[name] = info
 						}
-					})
+					}
+
+				case <-linkClose:
+					return nil
+
+				case <-addrClose:
+					return nil
+
+				case <-m.stop:
+					close(linkClose)
+					close(addrClose)
+					return nil
 				}
-
-			case <-linkClose:
-				return
-
-			case <-addrClose:
-				return
-
-			case <-m.stop:
-				close(linkClose)
-				close(addrClose)
+				return interfaces
+			}
+			if interfaces := f(); interfaces != nil {
+				// Update m._interfaces
+				m.Act(nil, func() {
+					m._interfaces = interfaces
+				})
+			} else {
+				// Exit
 				return
 			}
 		}
