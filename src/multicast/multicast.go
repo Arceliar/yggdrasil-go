@@ -367,7 +367,16 @@ func (m *Multicast) listen() {
 		phony.Block(m, func() {
 			interfaces = m._interfaces
 		})
-		if _, ok := interfaces[from.Zone]; ok {
+		_, ok := interfaces[from.Zone]
+		if !ok && !from.IP.IsLinkLocalUnicast() && rcm != nil {
+			for _, info := range interfaces {
+				if info.iface.Index == rcm.IfIndex {
+					ok = true
+					break
+				}
+			}
+		}
+		if ok {
 			addr.Zone = ""
 			pin := fmt.Sprintf("/?key=%s", hex.EncodeToString(key))
 			u, err := url.Parse("tls://" + addr.String() + pin)
